@@ -138,28 +138,28 @@ class BaseDriver(ABC):
         pyautogui.hotkey(*keys)
         logger.debug(f"Pressed hotkey: {keys}")
     
-    def find_window(self, title_pattern: str) -> Optional[int]:
+    def find_window(self, title_pattern: str, owner_names=None) -> Optional[object]:
         """
-        查找窗口
-        
-        Args:
-            title_pattern: 窗口标题模式
-        
-        Returns:
-            窗口句柄或 None
+        查找窗口。macOS 用 Quartz 按进程名/标题匹配，其他系统用 pygetwindow。
         """
+        import sys
+        if sys.platform == "darwin":
+            win = _find_mac_window(title_pattern, owner_names or [])
+            if win:
+                self.window_handle = win
+            return win
         try:
             import pygetwindow as gw
-            
+
             for window in gw.getAllWindows():
                 if title_pattern.lower() in window.title.lower():
                     self.window_handle = window
                     return window
         except ImportError:
             logger.debug("pygetwindow not installed")
-        
+
         return None
-    
+
     def bring_to_front(self):
         """将窗口带到前台"""
         if self.window_handle:
@@ -167,3 +167,44 @@ class BaseDriver(ABC):
                 self.window_handle.activate()
             except:
                 pass
+
+
+class MacWindow:
+    """macOS 窗口的最小封装（位置/大小 + 激活）"""
+
+    def __init__(self, owner: str, title: str, pid: int, left: int, top: int, width: int, height: int):
+        self.owner, self.title, self.pid = owner, title, pid
+        self.left, self.top, self.width, self.height = left, top, width, height
+
+    def activate(self):
+        import subprocess
+        subprocess.run(["osascript", "-e",
+                        f'tell application "System Events" to set frontmost of (first process whose unix id is {self.pid}) to true'],
+                       capture_output=True)
+
+    def __repr__(self):
+        return f"MacWindow({self.owner!r}, {self.left},{self.top},{self.width}x{self.height})"
+
+
+def _find_mac_window(title_pattern: str, owner_names) -> Optional[MacWindow]:
+    try:
+        import Quartz
+    except ImportError:
+        logger.warning("pyobjc-framework-Quartz not installed")
+        return None
+    opts = Quartz.kCGWindowListOptionOnScreenOnly | Quartz.kCGWindowListExcludeDesktopElements
+    wins = Quartz.CGWindowListCopyWindowInfo(opts, Quartz.kCGNullWindowID) or []
+    owners = [o.lower() for o in owner_names]
+    best = None
+    for w in wins:
+        owner = str(w.get("kCGWindowOwnerName", "") or "")
+        title = str(w.get("kCGWindowName", "") or "")
+        if w.get("kCGWindowLayer", 0) != 0:
+            continue
+        if owner.lower() in owners or (title_pattern and title_pattern.lower() in title.lower()):
+            bd = w["kCGWindowBounds"]
+            mw = MacWindow(owner, title, int(w["kCGWindowOwnerPID"]), int(bd["X"]), int(bd["Y"]),
+                           int(bd["Width"]), int(bd["Height"]))
+            if best is None or mw.width * mw.height > best.width * best.height:
+                best = mw
+    return best

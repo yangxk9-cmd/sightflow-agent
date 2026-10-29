@@ -3,6 +3,8 @@
 """
 
 import logging
+import subprocess
+import sys
 import time
 from typing import List, Optional, Tuple
 
@@ -23,6 +25,8 @@ class WeChatDriver(BaseDriver):
     
     # 微信窗口特征
     WINDOW_TITLE = "微信"
+    MAC_OWNER_NAMES = ["WeChat", "微信"]
+    IS_MAC = sys.platform == "darwin"
     
     # UI 区域（默认值，可校准）
     DEFAULT_CHAT_LIST_REGION = (0, 100, 250, 600)  # 左侧聊天列表
@@ -40,13 +44,15 @@ class WeChatDriver(BaseDriver):
         logger.info("Attaching to WeChat...")
         
         # 查找微信窗口
-        window = self.find_window(self.WINDOW_TITLE)
+        window = self.find_window(self.WINDOW_TITLE, self.MAC_OWNER_NAMES)
         
         if window:
             self.window_handle = window
             self.bring_to_front()
             time.sleep(0.5)  # 等待窗口激活
             
+            if self.IS_MAC:
+                self._layout_from_window(window)
             self.attached = True
             logger.info("Attached to WeChat successfully")
             return True
@@ -80,21 +86,42 @@ class WeChatDriver(BaseDriver):
             return
         
         # 点击输入框
-        x = self.input_region[0] + 50
-        y = self.input_region[1] + 20
+        x = self.input_region[0] + self.input_region[2] // 2
+        y = self.input_region[1] + 40
         self.click(x, y)
-        
         time.sleep(0.2)
-        
-        # 输入文字
+        # 清空可能残留的搜索文字（Cmd+A 再删）
         import pyautogui
-        pyautogui.write(text, interval=0.05)
+        if self.IS_MAC:
+            pyautogui.hotkey("command", "a")
+        else:
+            pyautogui.hotkey("ctrl", "a")
+        time.sleep(0.05)
+        self.press_key("backspace")
+        time.sleep(0.1)
+        # 输入文字
+        self._type_text(text)
         logger.debug(f"Typed message: {text[:30]}...")
     
-    def send(self):
-        """发送消息（按 Enter）"""
+    def send(self, verify: bool = True):
+        """发送消息（按 Enter），Mac 上发完自动截微信窗口，返回截图路径"""
         self.press_key("enter")
         logger.debug("Message sent")
+        if verify and self.IS_MAC:
+            time.sleep(0.8)
+            return self.screenshot_window()
+        return None
+
+    def screenshot_window(self, path: str = None) -> str:
+        """截取微信窗口区域到 ~/sightflow-test/shots/"""
+        import os
+        d = os.path.expanduser("~/sightflow-test/shots")
+        os.makedirs(d, exist_ok=True)
+        path = path or os.path.join(d, time.strftime("wechat_%Y%m%d_%H%M%S.png"))
+        w = self.window_handle
+        r = f"{int(w.left)},{int(w.top)},{int(w.width)},{int(w.height)}"
+        subprocess.run(["screencapture", "-x", "-R", r, path], check=True)
+        return path
     
     def get_chat_list(self) -> List[ChatInfo]:
         """获取聊天列表"""
@@ -123,13 +150,15 @@ class WeChatDriver(BaseDriver):
         try:
             import pyautogui
             
-            # Ctrl+F 打开搜索
-            self.hotkey("ctrl", "f")
+            # 打开搜索（Mac 用 Cmd+F）
+            self.bring_to_front()
             time.sleep(0.3)
-            
-            # 输入联系人名称
-            pyautogui.write(contact, interval=0.1)
-            time.sleep(0.5)
+            self.hotkey("command" if self.IS_MAC else "ctrl", "f")
+            time.sleep(0.4)
+
+            # 输入联系人名称（支持中文）
+            self._type_text(contact)
+            time.sleep(1.0)
             
             # 按 Enter 选择第一个结果
             self.press_key("enter")
@@ -142,6 +171,26 @@ class WeChatDriver(BaseDriver):
             logger.error(f"Search failed: {e}")
             return False
     
+    def _type_text(self, text: str):
+        """输入文本。Mac 上走剪贴板粘贴，支持中文；其他系统用 pyautogui.write。"""
+        import pyautogui
+        if self.IS_MAC:
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True)
+            time.sleep(0.1)
+            pyautogui.hotkey("command", "v")
+        else:
+            pyautogui.write(text, interval=0.05)
+
+    def _layout_from_window(self, win):
+        """按 Mac 微信窗口位置估算各区域（左侧图标栏约 60px，会话列表约 250px）。"""
+        x, y, w, h = win.left, win.top, win.width, win.height
+        list_left = x + 60
+        list_w = 320  # 新版 Mac 微信会话列表约 310px
+        chat_left = list_left + list_w
+        self.chat_list_region = (list_left, y + 60, list_w, h - 60)
+        self.chat_region = (chat_left, y + 60, w - (chat_left - x), h - 220)
+        self.input_region = (chat_left, y + h - 140, w - (chat_left - x), 120)
+
     def _find_in_chat_list(self, contact: str) -> bool:
         """在聊天列表中查找并点击"""
         # TODO: 实现视觉识别聊天列表项
